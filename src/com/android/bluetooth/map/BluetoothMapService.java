@@ -99,6 +99,10 @@ public class BluetoothMapService extends ProfileService {
 
     public static final int MSG_OBEX_AUTH_CHALL = 5003;
 
+    public static final int MSG_ACQUIRE_WAKE_LOCK = 5004;
+
+    public static final int MSG_RELEASE_WAKE_LOCK = 5005;
+
     private static final String BLUETOOTH_PERM = android.Manifest.permission.BLUETOOTH;
 
     private static final String BLUETOOTH_ADMIN_PERM = android.Manifest.permission.BLUETOOTH_ADMIN;
@@ -108,6 +112,10 @@ public class BluetoothMapService extends ProfileService {
     private static final int USER_TIMEOUT = 2;
 
     private static final int DISCONNECT_MAP = 3;
+
+    private static final int RELEASE_WAKE_LOCK_DELAY = 10000;
+
+    private PowerManager.WakeLock mWakeLock = null;
 
     private BluetoothAdapter mAdapter;
 
@@ -157,8 +165,204 @@ public class BluetoothMapService extends ProfileService {
            Log.v(TAG, "BluetoothMapService: mIsEmailEnabled: " + mIsEmailEnabled);
     }
     private final void closeService() {
-       if (VERBOSE) Log.v(TAG, "closeService");
-       mConnectionManager.closeAll();
+        if (DEBUG) Log.d(TAG, "MAP Service closeService in");
+
+        // exit initSocket early
+        mInterrupted = true;
+        closeServerSocket();
+
+        if (mAcceptThread != null) {
+            try {
+                mAcceptThread.shutdown();
+                mAcceptThread.join();
+                mAcceptThread = null;
+            } catch (InterruptedException ex) {
+                Log.w(TAG, "mAcceptThread close error" + ex);
+            }
+        }
+
+        if (mWakeLock != null) {
+            mWakeLock.release();
+            mWakeLock = null;
+        }
+
+        if (mServerSession != null) {
+            mServerSession.close();
+            mServerSession = null;
+        }
+
+        if (mBluetoothMnsObexClient != null) {
+            mBluetoothMnsObexClient.shutdown();
+            mBluetoothMnsObexClient = null;
+        }
+
+        closeConnectionSocket();
+
+        if (mSessionStatusHandler != null) {
+            mSessionStatusHandler.removeCallbacksAndMessages(null);
+        }
+        isWaitingAuthorization = false;
+
+        if (VERBOSE) Log.v(TAG, "MAP Service closeService out");
+    }
+
+    private final void startObexServerSession() throws IOException {
+        if (DEBUG) Log.d(TAG, "Map Service startObexServerSession");
+
+        // acquire the wakeLock before start Obex transaction thread
+        if (mWakeLock == null) {
+            PowerManager pm = (PowerManager)getSystemService(Context.POWER_SERVICE);
+            mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
+                    "StartingObexMapTransaction");
+            mWakeLock.setReferenceCounted(false);
+            mWakeLock.acquire();
+        }
+
+        mBluetoothMnsObexClient = new BluetoothMnsObexClient(this, mRemoteDevice,
+                                                             mSessionStatusHandler);
+        mMapServer = new BluetoothMapObexServer(mSessionStatusHandler, this,
+                                                mBluetoothMnsObexClient);
+        synchronized (this) {
+            // We need to get authentication now that obex server is up
+            mAuth = new BluetoothMapAuthenticator(mSessionStatusHandler);
+            mAuth.setChallenged(false);
+            mAuth.setCancelled(false);
+        }
+        // setup RFCOMM transport
+        BluetoothMapRfcommTransport transport = new BluetoothMapRfcommTransport(mConnSocket);
+        mServerSession = new ServerSession(transport, mMapServer, mAuth);
+        setState(BluetoothMap.STATE_CONNECTED);
+
+        mSessionStatusHandler.removeMessages(MSG_RELEASE_WAKE_LOCK);
+        mSessionStatusHandler.sendMessageDelayed(mSessionStatusHandler
+            .obtainMessage(MSG_RELEASE_WAKE_LOCK), RELEASE_WAKE_LOCK_DELAY);
+
+        if (VERBOSE) {
+            Log.v(TAG, "startObexServerSession() success!");
+        }
+    }
+
+    private void stopObexServerSession() {
+        if (DEBUG) Log.d(TAG, "MAP Service stopObexServerSession");
+
+        mSessionStatusHandler.removeMessages(MSG_ACQUIRE_WAKE_LOCK);
+        mSessionStatusHandler.removeMessages(MSG_RELEASE_WAKE_LOCK);
+
+        // Release the wake lock if obex transaction is over
+        if (mWakeLock != null) {
+            mWakeLock.release();
+            mWakeLock = null;
+        }
+
+        if (mServerSession != null) {
+            mServerSession.close();
+            mServerSession = null;
+        }
+
+        mAcceptThread = null;
+
+        if(mBluetoothMnsObexClient != null) {
+            mBluetoothMnsObexClient.shutdown();
+            mBluetoothMnsObexClient = null;
+        }
+        closeConnectionSocket();
+
+        // Last obex transaction is finished, we start to listen for incoming
+        // connection again
+        if (mAdapter.isEnabled()) {
+            startRfcommSocketListener();
+        }
+        setState(BluetoothMap.STATE_DISCONNECTED);
+    }
+
+
+
+    /**
+     * A thread that runs in the background waiting for remote rfcomm
+     * connect.Once a remote socket connected, this thread shall be
+     * shutdown.When the remote disconnect,this thread shall run again waiting
+     * for next request.
+     */
+    private class SocketAcceptThread extends Thread {
+
+        private boolean stopped = false;
+
+        @Override
+        public void run() {
+            BluetoothServerSocket serverSocket;
+            if (mServerSocket == null) {
+                if (!initSocket()) {
+                    return;
+                }
+            }
+
+            while (!stopped) {
+                try {
+                    if (DEBUG) Log.d(TAG, "Accepting socket connection...");
+                    serverSocket = mServerSocket;
+                    if(serverSocket == null) {
+                        Log.w(TAG, "mServerSocket is null");
+                        break;
+                    }
+                    mConnSocket = serverSocket.accept();
+                    if (DEBUG) Log.d(TAG, "Accepted socket connection...");
+                    synchronized (BluetoothMapService.this) {
+                        if (mConnSocket == null) {
+                            Log.w(TAG, "mConnSocket is null");
+                            break;
+                        }
+                        mRemoteDevice = mConnSocket.getRemoteDevice();
+                    }
+                    if (mRemoteDevice == null) {
+                        Log.i(TAG, "getRemoteDevice() = null");
+                        break;
+                    }
+
+                    sRemoteDeviceName = mRemoteDevice.getName();
+                    // In case getRemoteName failed and return null
+                    if (TextUtils.isEmpty(sRemoteDeviceName)) {
+                        sRemoteDeviceName = getString(R.string.defaultname);
+                    }
+                    boolean trust = mRemoteDevice.getTrustState();
+                    if (DEBUG) Log.d(TAG, "GetTrustState() = " + trust);
+
+
+                    if (trust) {
+                        try {
+                            if (DEBUG) Log.d(TAG, "incoming connection accepted from: "
+                                + sRemoteDeviceName + " automatically as trusted device");
+                            startObexServerSession();
+                        } catch (IOException ex) {
+                            Log.e(TAG, "catch exception starting obex server session"
+                                    + ex.toString());
+                        }
+                    } else {
+                        Intent intent = new
+                            Intent(BluetoothDevice.ACTION_CONNECTION_ACCESS_REQUEST);
+                        intent.setClassName(ACCESS_AUTHORITY_PACKAGE, ACCESS_AUTHORITY_CLASS);
+                        intent.putExtra(BluetoothDevice.EXTRA_ACCESS_REQUEST_TYPE,
+                                        BluetoothDevice.REQUEST_TYPE_MESSAGE_ACCESS);
+                        intent.putExtra(BluetoothDevice.EXTRA_DEVICE, mRemoteDevice);
+
+                        isWaitingAuthorization = true;
+                        sendBroadcast(intent, BLUETOOTH_ADMIN_PERM);
+
+                        if (DEBUG) Log.d(TAG, "waiting for authorization for connection from: "
+                                + sRemoteDeviceName);
+
+                    }
+                    stopped = true; // job done ,close this thread;
+                } catch (IOException ex) {
+                    stopped=true;
+                    if (VERBOSE) Log.v(TAG, "Accept exception: " + ex.toString());
+                }
+            }
+        }
+
+        void shutdown() {
+            stopped = true;
+            interrupt();
+        }
     }
 
     private final Handler mSessionStatusHandler = new Handler() {
@@ -193,6 +397,27 @@ public class BluetoothMapService extends ProfileService {
                     break;
                 case DISCONNECT_MAP:
                     disconnectMap((BluetoothDevice)msg.obj);
+                    break;
+                case MSG_ACQUIRE_WAKE_LOCK:
+                    if (mWakeLock == null) {
+                        PowerManager pm = (PowerManager)getSystemService(
+                                          Context.POWER_SERVICE);
+                        mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,
+                                    "StartingObexMapTransaction");
+                        mWakeLock.setReferenceCounted(false);
+                        mWakeLock.acquire();
+                        Log.w(TAG, "Acquire Wake Lock");
+                    }
+                    mSessionStatusHandler.removeMessages(MSG_RELEASE_WAKE_LOCK);
+                    mSessionStatusHandler.sendMessageDelayed(mSessionStatusHandler
+                      .obtainMessage(MSG_RELEASE_WAKE_LOCK), RELEASE_WAKE_LOCK_DELAY);
+                    break;
+                case MSG_RELEASE_WAKE_LOCK:
+                    if (mWakeLock != null) {
+                        mWakeLock.release();
+                        mWakeLock = null;
+                        Log.w(TAG, "Release Wake Lock");
+                    }
                     break;
                 default:
                     break;

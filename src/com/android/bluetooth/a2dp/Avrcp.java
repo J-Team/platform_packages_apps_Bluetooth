@@ -20,6 +20,7 @@ import java.util.Timer;
 import java.util.TimerTask;
 
 import android.app.PendingIntent;
+import android.bluetooth.BluetoothA2dp;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
@@ -159,6 +160,7 @@ final class Avrcp {
     private CachedRequest mCachedRequest = null;
 
     private static final int MESSAGE_CHANGE_PLAY_POS = 12;
+    private static final int MESSAGE_SET_A2DP_AUDIO_STATE = 13;
     private static final int MSG_UPDATE_STATE = 100;
     private static final int MSG_SET_METADATA = 101;
     private static final int MSG_SET_TRANSPORT_CONTROLS = 102;
@@ -1013,8 +1015,21 @@ final class Avrcp {
                 processGetFolderItems(folderListEntries.mScope, folderListEntries.mStart,
                     folderListEntries.mEnd, folderListEntries.mAttrCnt,
                     folderListEntries.mNumAttr, attrIds);
+		break;
+            case MESSAGE_SET_A2DP_AUDIO_STATE:
+                if (DEBUG) Log.v(TAG, "MESSAGE_SET_A2DP_AUDIO_STATE:" + msg.arg1);
+                updateA2dpAudioState(msg.arg1);
                 break;
             }
+        }
+    }
+
+    private void updateA2dpAudioState(int state) {
+        boolean isPlaying = (state == BluetoothA2dp.STATE_PLAYING);
+        if (isPlaying != isPlayingState(mCurrentPlayState)) {
+            updatePlayPauseState(isPlaying ? RemoteControlClient.PLAYSTATE_PLAYING :
+                                 RemoteControlClient.PLAYSTATE_PAUSED,
+                                 RemoteControlClient.PLAYBACK_POSITION_INVALID);
         }
     }
 
@@ -3134,6 +3149,20 @@ final class Avrcp {
         return playStatus;
     }
 
+    private boolean isPlayingState(int playState) {
+        boolean isPlaying = false;
+        switch (playState) {
+            case RemoteControlClient.PLAYSTATE_PLAYING:
+            case RemoteControlClient.PLAYSTATE_BUFFERING:
+                isPlaying = true;
+                break;
+            default:
+                isPlaying = false;
+                break;
+        }
+        return isPlaying;
+    }
+
     /**
      * This is called from AudioService. It will return whether this device supports abs volume.
      * NOT USED AT THE MOMENT.
@@ -3205,6 +3234,7 @@ final class Avrcp {
         return (int) Math.ceil((double) volume*AVRCP_MAX_VOL/mAudioStreamMax);
     }
 
+<<<<<<< HEAD
 
 private void updateLocalPlayerSettings( byte[] data) {
         for (int i = 0; i < data.length; i += 2) {
@@ -3338,6 +3368,14 @@ private void updateLocalPlayerSettings( byte[] data) {
         msg.arg1 = GET_VALUE_TEXT;
         mPendingCmds.add(new Integer(msg.arg1));
         mHandler.sendMessageDelayed(msg, 130);
+=======
+    /**
+     * This is called from A2dpStateMachine to set A2dp audio state.
+     */
+    public void setA2dpAudioState(int state) {
+        Message msg = mHandler.obtainMessage(MESSAGE_SET_A2DP_AUDIO_STATE, state, 0);
+        mHandler.sendMessage(msg);
+>>>>>>> android-4.4.3_r1.1
     }
 
     // Do not modify without updating the HAL bt_rc.h files.

@@ -60,6 +60,7 @@ public class BluetoothMnsObexClient {
     private ClientSession mClientSession;
     private boolean mConnected = false;
     BluetoothDevice mRemoteDevice;
+    private Handler mCallback = null;
     private BluetoothMapContentObserver mObserver;
     private BluetoothMapContentObserver mEmailObserver;
     private boolean mObserverRegistered = false;
@@ -74,7 +75,8 @@ public class BluetoothMnsObexClient {
             ParcelUuid.fromString("00001133-0000-1000-8000-00805F9B34FB");
 
 
-    public BluetoothMnsObexClient(Context context, BluetoothDevice remoteDevice) {
+    public BluetoothMnsObexClient(Context context, BluetoothDevice remoteDevice,
+                                  Handler callback) {
         if (remoteDevice == null) {
             throw new NullPointerException("Obex transport is null");
         }
@@ -84,6 +86,9 @@ public class BluetoothMnsObexClient {
         mHandler = new MnsObexClientHandler(looper);
         mContext = context;
         mRemoteDevice = remoteDevice;
+        mCallback = callback;
+        mObserver = new BluetoothMapContentObserver(mContext);
+        mObserver.init();
     }
 
     public Handler getMessageHandler() {
@@ -336,6 +341,15 @@ public class BluetoothMnsObexClient {
         int responseCode = -1;
         HeaderSet request;
         int maxChunkSize, bytesToWrite, bytesWritten = 0;
+        ClientSession clientSession = mClientSession;
+
+        if ((!mConnected) || (clientSession == null)) {
+            Log.w(TAG, "sendEvent after disconnect:" + mConnected);
+            return responseCode;
+        }
+
+        notifyUpdateWakeLock();
+
         request = new HeaderSet();
         BluetoothMapAppParams appParams = new BluetoothMapAppParams();
         appParams.setMasInstanceId(masInstanceId);
@@ -465,5 +479,10 @@ public class BluetoothMnsObexClient {
             }
             mWakeLock = null;
         }
+
+    private void notifyUpdateWakeLock() {
+        Message msg = Message.obtain(mCallback);
+        msg.what = BluetoothMapService.MSG_ACQUIRE_WAKE_LOCK;
+        msg.sendToTarget();
     }
 }
